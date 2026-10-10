@@ -328,9 +328,10 @@ async function withPairingValidation(
     container: HTMLDivElement; input: HTMLInputElement; submit: () => Promise<void>;
     retry: () => Promise<void>; close: () => Promise<void>; sessionIs: (kind: string) => Promise<boolean>;
     background401: () => Promise<void>; replaceSession: () => void; logout: () => Promise<boolean>; replaceTarget: () => void;
+    startBackground401: () => Promise<Response>; backgroundAttempts: () => number; refreshTarget: () => void;
     counts: { posts: number; validations: number; connected: number; bootstraps: number };
   }) => Promise<void>,
-  bootstrapResponse: () => Response = () => new Response(null, { status: 401 }),
+  bootstrapResponse: (html: (kind: string) => string) => Response | Promise<Response> = () => new Response(null, { status: 401 }),
 ) {
   const keys = ["window", "document", "navigator", "sessionStorage", "localStorage", "fetch", "IS_REACT_ACT_ENVIRONMENT"] as const;
   const previous = Object.fromEntries(keys.map(key => [key, Reflect.get(globalThis, key)]));
@@ -340,6 +341,7 @@ async function withPairingValidation(
     Object.defineProperty(globalThis, key, { configurable: true, value });
   }
   const counts = { posts: 0, validations: 0, connected: 0, bootstraps: 0 };
+  let backgroundAttempts = 0;
   const html = (kind: string) => [
     `<meta name="opencodex-session-token" content="ocx_session_${kind}">`,
     `<meta name="opencodex-session-csrf" content="${kind}-csrf">`,
@@ -349,12 +351,15 @@ async function withPairingValidation(
   const mockFetch = (async (input, init) => {
     const url = String(input);
     if (url.endsWith("/opencodex-session")) {
-      if (init?.method !== "POST") { counts.bootstraps++; return bootstrapResponse(); }
+      if (init?.method !== "POST") { counts.bootstraps++; return bootstrapResponse(html); }
       counts.posts++;
       return new Response(html("candidate"), { headers: { "content-type": "text/html" } });
     }
     const headers = new Headers(init?.headers);
-    if (url.endsWith("/api/background")) return new Response(null, { status: 401 });
+    if (url.endsWith("/api/background")) {
+      backgroundAttempts++;
+      return headers.get("x-opencodex-api-key") === "ocx_session_recovery" ? Response.json({ ok: true }) : new Response(null, { status: 401 });
+    }
     if (url.endsWith("/api/link/status")) {
       expect(headers.get("x-opencodex-api-key")).toBe("ocx_session_candidate");
       if (++counts.validations === 1) return firstValidation();
@@ -365,8 +370,13 @@ async function withPairingValidation(
       && headers.get("x-opencodex-csrf-token") === "previous-csrf"
       && headers.get("x-opencodex-gui-origin") === "http://localhost",
       candidate: headers.get("x-opencodex-api-key") === "ocx_session_candidate",
-      replacement: headers.get("x-opencodex-api-key") === "ocx_session_replacement",
-      missing: !headers.has("x-opencodex-api-key") });
+      replacement: headers.get("x-opencodex-api-key") === "ocx_session_replacement"
+        && headers.get("x-opencodex-csrf-token") === "replacement-csrf"
+        && headers.get("x-opencodex-gui-origin") === "http://localhost",
+      recovery: headers.get("x-opencodex-api-key") === "ocx_session_recovery"
+        && headers.get("x-opencodex-csrf-token") === "recovery-csrf"
+        && headers.get("x-opencodex-gui-origin") === "http://localhost",
+      missing: !headers.has("x-opencodex-api-key") && !headers.has("x-opencodex-csrf-token") && !headers.has("x-opencodex-gui-origin") });
   }) as typeof fetch;
   Object.defineProperty(win, "fetch", { configurable: true, value: mockFetch });
   Object.defineProperty(globalThis, "fetch", { configurable: true, value: mockFetch });
@@ -401,6 +411,9 @@ async function withPairingValidation(
       }),
       close: () => act(async () => root.render(null)),
       background401: () => act(async () => { expect((await win.fetch(`${targets.shared.baseUrl}/api/background`)).status).toBe(401); }),
+      startBackground401: () => win.fetch(`${targets.shared.baseUrl}/api/background`),
+      backgroundAttempts: () => backgroundAttempts,
+      refreshTarget: () => { api.configureApiTargets(targets); },
       replaceSession: () => { api.installApiSessionFromHtml("shared", html("replacement")); },
       logout: () => api.logoutApiSession("shared"),
       replaceTarget: () => {
@@ -515,4 +528,58 @@ test("a malformed recovery bootstrap does not lose pending cancellation ownershi
       await act(async () => { release(new Response(null, { status: 401 })); });
       expect(await sessionIs("previous")).toBe(true);
     }, () => new Response("<html></html>", { headers: { "content-type": "text/html" } }));
+});
+
+const delayedRecoveryCases = (["headers", "body"] as const).flatMap(stage =>
+  (["malformed", "valid"] as const).flatMap(htmlKind =>
+    (["rejection", "cancellation", "new-login", "logout", "authenticated-logout", "target", "current", "refresh"] as const).map(action => [stage, htmlKind, action] as const)));
+
+test.each(delayedRecoveryCases)("bootstrap pending at %s with %s HTML yields to %s", async (stage, htmlKind, action) => {
+  let releaseValidation!: (response: Response) => void;
+  let releaseBootstrap!: () => void;
+  let markBootstrapPending!: () => void;
+  const bootstrapPending = new Promise<void>(resolve => { markBootstrapPending = resolve; });
+  await withPairingValidation(() => new Promise<Response>(resolve => { releaseValidation = resolve; }),
+    async ({ submit, startBackground401, backgroundAttempts, close, replaceSession, replaceTarget, refreshTarget, logout, sessionIs, counts }) => {
+      await submit();
+      const background = startBackground401();
+      await act(async () => { await bootstrapPending; });
+      expect(counts.bootstraps).toBe(1);
+      expect(await sessionIs("missing")).toBe(true);
+      if (action === "cancellation") await close();
+      if (action === "new-login") replaceSession();
+      if (action === "logout") expect(await logout()).toBe(false);
+      if (action === "authenticated-logout") { replaceSession(); expect(await logout()).toBe(true); }
+      if (action === "target") { replaceTarget(); replaceSession(); }
+      if (action === "refresh") refreshTarget();
+      if (action === "rejection" || action === "cancellation") {
+        await act(async () => { releaseValidation(new Response(null, { status: 401 })); });
+      }
+      const current = action === "current" || action === "refresh";
+      await act(async () => {
+        releaseBootstrap();
+        expect((await background).status).toBe(current && htmlKind === "valid" ? 200 : 401);
+      });
+      expect(backgroundAttempts()).toBe(current && htmlKind === "valid" ? 2 : 1);
+      const expected = current ? (htmlKind === "valid" ? "recovery" : "missing")
+        : action === "new-login" || action === "target" ? "replacement" : action === "logout" || action === "authenticated-logout" ? "missing" : "previous";
+      expect(await sessionIs(expected)).toBe(true);
+      // Finishing the obsolete validation must also preserve the authoritative state.
+      await close();
+      await act(async () => { releaseValidation(new Response(null, { status: 401 })); });
+      expect(await sessionIs(current && htmlKind === "malformed" ? "previous" : expected)).toBe(true);
+      expect(winStorageHasSession()).toBe(false);
+    }, html => {
+      const body = htmlKind === "valid" ? html("recovery") : "<html></html>";
+      const response = new Response(body, { headers: { "content-type": "text/html" } });
+      if (stage === "headers") return new Promise<Response>(resolve => {
+        releaseBootstrap = () => resolve(response);
+        markBootstrapPending();
+      });
+      response.text = () => new Promise<string>(resolve => {
+        releaseBootstrap = () => resolve(body);
+        markBootstrapPending();
+      });
+      return response;
+    });
 });
