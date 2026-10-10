@@ -27,8 +27,9 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 function mountWindow(
-  role: "standalone" | "hub",
-  options: { session?: boolean; url?: string; managementAuthRequired?: boolean; linkStatusCode?: number; language?: string } = {},
+  role: "standalone" | "hub" | "client",
+  options: { session?: boolean; url?: string; managementAuthRequired?: boolean; linkStatusCode?: number; language?: string;
+    fetchOverride?: (input: RequestInfo | URL, init?: RequestInit) => Response | Promise<Response> | undefined } = {},
 ): void {
   const url = options.url ?? "http://localhost/#remote";
   const session = options.session ?? true;
@@ -62,6 +63,8 @@ function mountWindow(
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   (globalThis as Record<string, unknown>).__APP_VERSION__ = "0.0.0-test";
   const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const override = options.fetchOverride?.(input, init);
+    if (override !== undefined) return override;
     const url = String(input instanceof Request ? input.url : input);
     if (url.includes("/opencodex-session") && init?.method === "POST") {
       pairingPosts++;
@@ -389,4 +392,62 @@ for (const stage of ["headers", "body"] as const) test(`navigation during Remote
   await act(async () => { release(jsonResponse({ role: "standalone", listener: { state: "off", port: null }, links: [], child: null })); });
   expect(container.querySelector(".connect-pairing")).not.toBeNull();
   expect(container.querySelector('[role="switch"]')).toBeNull();
+});
+
+const discoveryBootstrapCases = (["headers", "body"] as const).flatMap(stage =>
+  (["valid", "malformed"] as const).flatMap(html =>
+    (["logout", "new-login"] as const).map(action => [stage, html, action] as const)));
+
+test.each(discoveryBootstrapCases)("App discovery bootstrap pending at %s with %s HTML yields after recovery and %s", async (stage, htmlKind, action) => {
+  let releaseInitial!: () => void;
+  let bootstraps = 0;
+  let logoutPosts = 0;
+  const sessionHtml = (kind: string) => `<meta name="opencodex-session-token" content="ocx_session_${kind}"><meta name="opencodex-session-csrf" content="${kind}-csrf"><meta name="opencodex-session-origin" content="http://localhost"><meta name="opencodex-session-server-origin" content="https://hub.example.test">`;
+  mountWindow("client", { fetchOverride: (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/api/machine/status")) return jsonResponse({
+      mode: "client", connected: true, machineBase: "http://localhost",
+      sharedBase: "http://localhost/api/machine/hub-relay", sharedServerOrigin: "https://hub.example.test",
+      managementTransport: "relay", apiKeyId: "fixture", protocolVersion: 1, connectedAt: "2026-10-10T00:00:00Z", hubReachability: "unknown",
+    });
+    if (url.endsWith("/api/machine/hub-relay/opencodex-session")) {
+      if (++bootstraps > 1) return new Response(sessionHtml("recovered"));
+      const body = htmlKind === "valid" ? sessionHtml("obsolete") : "<html></html>";
+      const response = new Response(body);
+      if (stage === "headers") return new Promise<Response>(resolve => { releaseInitial = () => resolve(response); });
+      response.text = () => new Promise<string>(resolve => { releaseInitial = () => resolve(body); });
+      return response;
+    }
+    if (url.includes("/hub-relay/api/remote-workspace")) {
+      return ["ocx_session_recovered", "ocx_session_replacement"].includes(new Headers(init?.headers).get("x-opencodex-api-key") ?? "")
+        ? jsonResponse({ available: false }) : new Response(null, { status: 401 });
+    }
+    if (url.endsWith("/api/session/logout")) { logoutPosts++; return new Response(null, { status: 200 }); }
+    if (url.endsWith("/api/observe")) {
+      const headers = new Headers(init?.headers);
+      return jsonResponse({ missing: !headers.has("x-opencodex-api-key") && !headers.has("x-opencodex-csrf-token") && !headers.has("x-opencodex-gui-origin"),
+        replacement: headers.get("x-opencodex-api-key") === "ocx_session_replacement"
+          && headers.get("x-opencodex-csrf-token") === "replacement-csrf" && headers.get("x-opencodex-gui-origin") === "http://localhost" });
+    }
+    if (url.endsWith("/api/unauthorized")) return new Response(null, { status: 401 });
+    return undefined;
+  } });
+  await mountApp();
+  await waitFor(() => bootstraps === 2 && releaseInitial !== undefined);
+  const api = await import("../src/api");
+  expect(api.hasApiSession("shared")).toBe(true);
+  const logout = container.querySelector<HTMLButtonElement>('button[aria-label="Log out remote session"]');
+  expect(logout).not.toBeNull();
+  await act(async () => { logout!.click(); });
+  expect(logoutPosts).toBe(1);
+  expect(api.hasApiSession("shared")).toBe(false);
+  if (action === "new-login") api.installApiSessionFromHtml("shared", sessionHtml("replacement"));
+  await act(async () => { releaseInitial(); });
+  const observed = await (await api.fetchApiSessionValidation("shared", "http://localhost/api/machine/hub-relay/api/observe", { method: "POST" })).json();
+  expect(observed[action === "new-login" ? "replacement" : "missing"]).toBe(true);
+  if (action === "logout") {
+    expect((await window.fetch("http://localhost/api/machine/hub-relay/api/unauthorized")).status).toBe(401);
+    expect(bootstraps).toBe(2);
+    expect(container.querySelector('button[aria-label="Log out remote session"]')).toBeNull();
+  }
 });

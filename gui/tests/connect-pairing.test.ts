@@ -316,8 +316,9 @@ test("cancelled Remote Link validation forwards the abort signal and rejects a l
     observedSignal = init?.signal;
     return new Promise<Response>(resolve => { release = resolve; });
   }) as typeof fetch, controller.signal);
-  expect(observedSignal).toBe(controller.signal);
+  expect(observedSignal?.aborted).toBe(false);
   controller.abort();
+  expect(observedSignal?.aborted).toBe(true);
   release(Response.json({ role: "standalone", listener: { state: "off", port: null }, links: [], child: null }));
   await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 });
@@ -329,6 +330,7 @@ async function withPairingValidation(
     retry: () => Promise<void>; close: () => Promise<void>; sessionIs: (kind: string) => Promise<boolean>;
     background401: () => Promise<void>; replaceSession: () => void; logout: () => Promise<boolean>; replaceTarget: () => void;
     startBackground401: () => Promise<Response>; backgroundAttempts: () => number; refreshTarget: () => void;
+    signals: { pairing?: AbortSignal | null; validation?: AbortSignal | null };
     counts: { posts: number; validations: number; connected: number; bootstraps: number };
   }) => Promise<void>,
   bootstrapResponse: (html: (kind: string) => string) => Response | Promise<Response> = () => new Response(null, { status: 401 }),
@@ -347,6 +349,7 @@ async function withPairingValidation(
   }
   const counts = { posts: 0, validations: 0, connected: 0, bootstraps: 0 };
   let backgroundAttempts = 0;
+  const signals: { pairing?: AbortSignal | null; validation?: AbortSignal | null } = {};
   const html = (kind: string) => [
     `<meta name="opencodex-session-token" content="ocx_session_${kind}">`,
     `<meta name="opencodex-session-csrf" content="${kind}-csrf">`,
@@ -358,6 +361,7 @@ async function withPairingValidation(
     if (url.endsWith("/opencodex-session")) {
       if (init?.method !== "POST") { counts.bootstraps++; return bootstrapResponse(html); }
       counts.posts++;
+      signals.pairing = init?.signal;
       if (responses.pairing) return responses.pairing(html);
       return new Response(html("candidate"), { headers: { "content-type": "text/html" } });
     }
@@ -369,6 +373,7 @@ async function withPairingValidation(
     }
     if (url.endsWith("/api/session/logout") && responses.logout) return responses.logout();
     if (url.endsWith("/api/link/status")) {
+      signals.validation = init?.signal;
       expect(headers.get("x-opencodex-api-key")).toBe("ocx_session_candidate");
       if (++counts.validations === 1) return firstValidation();
       return Response.json({ role: "standalone", listener: { state: "off", port: null }, links: [], child: null });
@@ -410,7 +415,7 @@ async function withPairingValidation(
     const input = container.querySelector("#connect-pairing-code") as HTMLInputElement;
     Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(input, `ocx_pair_${"c".repeat(43)}`);
     await act(async () => { input.dispatchEvent(new win.Event("input", { bubbles: true })); });
-    await check({ container, input, counts,
+    await check({ container, input, counts, signals,
       submit: () => act(async () => { input.closest("form")!.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); }),
       retry: () => act(async () => {
         const button = Array.from(container.querySelectorAll("button")).find(button => button.textContent === "Retry validation");
@@ -762,4 +767,71 @@ test("explicit login after completed logout permits current automatic recovery",
       expect(counts.bootstraps).toBe(1);
       expect(await sessionIs("recovery")).toBe(true);
     }, html => new Response(html("recovery")));
+});
+
+test.each(["headers", "body"] as const)("stalled exchange %s releases busy state and never installs late credentials", async stage => {
+  const { setPairingDeadlineForTests } = await import("../src/connect-pairing-transport");
+  setPairingDeadlineForTests(20);
+  let release!: () => void;
+  try {
+    await withPairingValidation(() => Response.json({ role: "standalone", listener: { state: "off", port: null }, links: [], child: null }),
+      async ({ submit, container, input, sessionIs, signals, counts }) => {
+        await submit();
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+        expect(signals.pairing?.aborted).toBe(true);
+        expect(input.disabled).toBe(false);
+        expect(container.querySelector('button[type="submit"]')?.textContent).not.toBe("Connecting…");
+        expect(container.querySelector('[role="alert"]')).not.toBeNull();
+        expect(await sessionIs("previous")).toBe(true);
+        await act(async () => { release(); });
+        expect(await sessionIs("previous")).toBe(true);
+        expect(counts).toEqual({ posts: 1, validations: 0, connected: 0, bootstraps: 0 });
+      }, undefined, { pairing: html => {
+        const body = html("candidate");
+        const response = new Response(body);
+        if (stage === "headers") return new Promise<Response>(resolve => { release = () => resolve(response); });
+        response.text = () => new Promise<string>(resolve => { release = () => resolve(body); });
+        return response;
+      } });
+  } finally { setPairingDeadlineForTests(10_000); }
+});
+
+test.each(["headers", "body"] as const)("stalled validation %s keeps the handoff for retry and releases busy state", async stage => {
+  const { setPairingDeadlineForTests } = await import("../src/connect-pairing-transport");
+  setPairingDeadlineForTests(20);
+  let release!: () => void;
+  const status = { role: "standalone", listener: { state: "off", port: null }, links: [], child: null };
+  try {
+    await withPairingValidation(() => {
+      const response = Response.json(status);
+      if (stage === "headers") return new Promise<Response>(resolve => { release = () => resolve(response); });
+      response.json = () => new Promise(resolve => { release = () => resolve(status); });
+      return response;
+    }, async ({ submit, retry, close, container, sessionIs, signals, counts }) => {
+      await submit();
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+      expect(signals.validation?.aborted).toBe(true);
+      expect(container.querySelector('button[type="submit"]')?.textContent).toBe("Retry validation");
+      expect((container.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(false);
+      expect(await sessionIs("candidate")).toBe(true);
+      await retry();
+      expect(counts).toEqual({ posts: 1, validations: 2, connected: 1, bootstraps: 0 });
+      await act(async () => { release(); });
+      expect(counts.connected).toBe(1);
+      await close();
+      expect(await sessionIs("candidate")).toBe(true);
+    });
+  } finally { setPairingDeadlineForTests(10_000); }
+});
+
+test("cancellation during the exchange install notification rolls back its unreturned handoff", async () => {
+  await withPairingValidation(() => new Response(null, { status: 503 }), async ({ sessionIs }) => {
+    const { submitConnectPairing } = await import("../src/connect-pairing-transport");
+    const { standaloneApiTargets } = await import("../src/api-targets");
+    const controller = new AbortController();
+    window.addEventListener("opencodex:session-changed", () => controller.abort(), { once: true });
+    await expect(submitConnectPairing(standaloneApiTargets("https://hub.example.test").shared,
+      `ocx_pair_${"c".repeat(43)}`, undefined, controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(await sessionIs("previous")).toBe(true);
+  });
 });

@@ -1,5 +1,5 @@
 import { promptForAdminToken, type AdminTokenVerifier } from "./admin-token-dialog";
-import { createBoundedFetch } from "./bounded-fetch";
+import { createBoundedFetch, withFetchDeadline } from "./bounded-fetch";
 import { adminTokenPromptAllowed, standaloneApiTargets, type ApiPlane, type ApiTarget, type ApiTargets } from "./api-targets";
 
 /**
@@ -355,21 +355,30 @@ function withAuth(
   return [input, { ...init, headers }];
 }
 
-async function reBootstrapSessionToken(recovery: RecoveryAttempt): Promise<RebootstrapResult> {
+async function reBootstrapSessionToken(recovery: RecoveryAttempt, caller?: AbortSignal, deadlineMs = rebootstrapTimeoutMs): Promise<RebootstrapResult> {
   if (!rawFetch || !isCurrentRecovery(recovery)) return { kind: "failed" };
   const { plane, state } = recovery;
-  const bounded = createBoundedFetch(rebootstrapTimeoutMs);
+  const send = rawFetch;
   try {
-    const [input, init] = withAuth(plane, state.target.bootstrapPath, { cache: "no-store", signal: bounded.signal }, null);
-    const response = await rawFetch(input, init);
-    if (bounded.signal.aborted || !isCurrentRecovery(recovery)) return { kind: "failed" };
-    if (!response.ok) return response.status >= 400 && response.status < 500 ? { kind: "unavailable" } : { kind: "failed" };
-    const html = await response.text();
-    if (bounded.signal.aborted || !isCurrentRecovery(recovery)) return { kind: "failed" };
-    if (!installSessionFromHtml(plane, html, recovery)) return { kind: "unavailable" };
-    return { kind: "minted", token: state.session.token! };
+    return await withFetchDeadline<RebootstrapResult>(deadlineMs, caller, async signal => {
+      const [input, init] = withAuth(plane, state.target.bootstrapPath, { cache: "no-store", signal }, null);
+      const response = await send(input, init);
+      if (signal.aborted || !isCurrentRecovery(recovery)) return { kind: "failed" };
+      if (!response.ok) return response.status >= 400 && response.status < 500 ? { kind: "unavailable" } : { kind: "failed" };
+      const html = await response.text();
+      if (signal.aborted || !isCurrentRecovery(recovery)) return { kind: "failed" };
+      if (!installSessionFromHtml(plane, html, recovery)) return { kind: "unavailable" };
+      return { kind: "minted", token: state.session.token! };
+    });
   } catch { return { kind: "failed" }; }
-  finally { bounded.clear(); }
+}
+
+/** Discovery is automatic recovery, never an explicit login that can override logout. */
+export async function bootstrapApiSession(plane: ApiPlane, signal?: AbortSignal): Promise<boolean> {
+  const state = runtime(plane);
+  const recovery: RecoveryAttempt = { plane, state, generation: state.generation, active: true };
+  try { return (await reBootstrapSessionToken(recovery, signal, 5_000)).kind === "minted"; }
+  finally { recovery.active = false; }
 }
 
 async function verifyAdminToken(plane: ApiPlane, token: string): ReturnType<AdminTokenVerifier> {

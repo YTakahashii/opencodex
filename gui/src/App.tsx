@@ -21,7 +21,7 @@ import { NAV_GROUPS, groupForPage, visibleGroupPages } from "./nav-groups";
 import { SectionSwitcher } from "./components/SectionSwitcher";
 import { useI18n, useT, LOCALES, localeDisplayName, type Locale, type TKey } from "./i18n/shared";
 import { Notice, Select, ToastNotice, type NoticeTone } from "./ui";
-import { configureApiTargets, hasApiSession, installApiAuthFetch, installApiSessionFromHtml, logoutApiSession, SESSION_UNAVAILABLE_EVENT } from "./api";
+import { bootstrapApiSession, configureApiTargets, hasApiSession, installApiAuthFetch, logoutApiSession, SESSION_UNAVAILABLE_EVENT } from "./api";
 import { apiBaseForPlane, discoverApiTargets, isConnectedRuntime, runtimeRoleFromDocument, standaloneApiTargets, type ApiTargets } from "./api-targets";
 import { ConnectPairingForm } from "./connect-pairing";
 import { validateRemoteLinkSession } from "./connect-pairing-transport";
@@ -171,13 +171,7 @@ export default function App() {
       configureApiTargets(next);
       setTargets(next);
       if (next.connected && !hasApiSession("shared")) {
-        try {
-          const response = await fetch(next.shared.bootstrapPath, {
-            cache: "no-store",
-            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5_000)]),
-          });
-          if (response.ok) installApiSessionFromHtml("shared", await response.text());
-        } catch { /* pairing form remains available */ }
+        await bootstrapApiSession("shared", controller.signal);
       }
       if (controller.signal.aborted) return;
       setSharedSessionReady(hasApiSession("shared"));
