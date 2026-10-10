@@ -332,6 +332,11 @@ async function withPairingValidation(
     counts: { posts: number; validations: number; connected: number; bootstraps: number };
   }) => Promise<void>,
   bootstrapResponse: (html: (kind: string) => string) => Response | Promise<Response> = () => new Response(null, { status: 401 }),
+  responses: {
+    pairing?: (html: (kind: string) => string) => Response | Promise<Response>;
+    logout?: () => Response | Promise<Response>;
+    background?: (headers: Headers) => Response | Promise<Response>;
+  } = {},
 ) {
   const keys = ["window", "document", "navigator", "sessionStorage", "localStorage", "fetch", "IS_REACT_ACT_ENVIRONMENT"] as const;
   const previous = Object.fromEntries(keys.map(key => [key, Reflect.get(globalThis, key)]));
@@ -353,13 +358,16 @@ async function withPairingValidation(
     if (url.endsWith("/opencodex-session")) {
       if (init?.method !== "POST") { counts.bootstraps++; return bootstrapResponse(html); }
       counts.posts++;
+      if (responses.pairing) return responses.pairing(html);
       return new Response(html("candidate"), { headers: { "content-type": "text/html" } });
     }
     const headers = new Headers(init?.headers);
     if (url.endsWith("/api/background")) {
       backgroundAttempts++;
+      if (responses.background) return responses.background(headers);
       return headers.get("x-opencodex-api-key") === "ocx_session_recovery" ? Response.json({ ok: true }) : new Response(null, { status: 401 });
     }
+    if (url.endsWith("/api/session/logout") && responses.logout) return responses.logout();
     if (url.endsWith("/api/link/status")) {
       expect(headers.get("x-opencodex-api-key")).toBe("ocx_session_candidate");
       if (++counts.validations === 1) return firstValidation();
@@ -582,4 +590,176 @@ test.each(delayedRecoveryCases)("bootstrap pending at %s with %s HTML yields to 
       });
       return response;
     });
+});
+
+// Explicit logout blocks automatic renewal in either response order; only a new login wins.
+test.each(["background-first", "logout-first"] as const)("pending logout suppresses recovery with %s responses", async order => {
+  let releaseLogout!: (response: Response) => void;
+  let releaseBackground!: (response: Response) => void;
+  let releaseBootstrap: (() => void) | undefined;
+  await withPairingValidation(() => new Response(null, { status: 503 }),
+    async ({ submit, logout, startBackground401, sessionIs, counts, close }) => {
+      await submit();
+      const loggingOut = logout();
+      const background = startBackground401();
+      releaseBackground(new Response(null, { status: 401 }));
+      // Let the 401 handler run. A broken implementation enters the held bootstrap.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (order === "background-first") {
+        releaseBootstrap?.();
+        expect((await background).status).toBe(401);
+        expect(await sessionIs("candidate")).toBe(true);
+      }
+      releaseLogout(new Response(null, { status: 200 }));
+      expect(await loggingOut).toBe(true);
+      if (order === "logout-first") {
+        releaseBootstrap?.();
+        expect((await background).status).toBe(401);
+      }
+      expect(counts.bootstraps).toBe(0);
+      expect(await sessionIs("missing")).toBe(true);
+      const afterLogout = startBackground401();
+      releaseBackground(new Response(null, { status: 401 }));
+      expect((await afterLogout).status).toBe(401);
+      expect(counts.bootstraps).toBe(0);
+      await close();
+      expect(await sessionIs("missing")).toBe(true);
+    }, html => new Promise<Response>(resolve => { releaseBootstrap = () => resolve(new Response(html("recovery"))); }), {
+      logout: () => new Promise<Response>(resolve => { releaseLogout = resolve; }),
+      background: headers => headers.get("x-opencodex-api-key") === "ocx_session_recovery"
+        ? Response.json({ ok: true }) : new Promise<Response>(resolve => { releaseBackground = resolve; }),
+    });
+});
+
+test.each(["success", "failure"] as const)("explicit login wins over pending logout %s", async outcome => {
+  let releaseLogout!: (response: Response) => void;
+  await withPairingValidation(() => new Response(null, { status: 503 }),
+    async ({ submit, logout, replaceSession, sessionIs, close }) => {
+      await submit();
+      const loggingOut = logout();
+      replaceSession();
+      releaseLogout(new Response(null, { status: outcome === "success" ? 200 : 401 }));
+      expect(await loggingOut).toBe(outcome === "success");
+      expect(await sessionIs("replacement")).toBe(true);
+      await close();
+      expect(await sessionIs("replacement")).toBe(true);
+    }, undefined, { logout: () => new Promise<Response>(resolve => { releaseLogout = resolve; }) });
+});
+
+test("failed logout releases automatic recovery suppression", async () => {
+  await withPairingValidation(() => new Response(null, { status: 503 }),
+    async ({ submit, logout, startBackground401, sessionIs, counts }) => {
+      await submit();
+      expect(await logout()).toBe(false);
+      expect((await startBackground401()).status).toBe(200);
+      expect(counts.bootstraps).toBe(1);
+      expect(await sessionIs("recovery")).toBe(true);
+    }, html => new Response(html("recovery")), { logout: () => new Response(null, { status: 503 }) });
+});
+
+const delayedExchangeCases = (["headers", "body"] as const).flatMap(stage =>
+  (["new-login", "logout", "pending-logout", "target", "cancellation", "recovery", "refresh"] as const).map(action => [stage, action] as const));
+
+test.each(delayedExchangeCases)("pairing exchange pending at %s yields to %s", async (stage, action) => {
+  let releaseExchange!: () => void;
+  let releaseLogout!: (response: Response) => void;
+  let markPending!: () => void;
+  const pending = new Promise<void>(resolve => { markPending = resolve; });
+  await withPairingValidation(() => new Response(null, { status: 503 }),
+    async ({ submit, replaceSession, logout, replaceTarget, refreshTarget, close, startBackground401, sessionIs, counts }) => {
+      await submit();
+      await pending;
+      let loggingOut: Promise<boolean> | undefined;
+      if (action === "new-login") replaceSession();
+      if (action === "logout" || action === "pending-logout") {
+        loggingOut = logout();
+        if (action === "logout") { releaseLogout(new Response(null, { status: 200 })); expect(await loggingOut).toBe(true); }
+      }
+      if (action === "target") { replaceTarget(); replaceSession(); }
+      if (action === "cancellation") await close();
+      if (action === "recovery") expect((await startBackground401()).status).toBe(200);
+      if (action === "refresh") refreshTarget();
+      await act(async () => { releaseExchange(); });
+      expect(counts.posts).toBe(1);
+      expect(counts.validations).toBe(action === "refresh" ? 1 : 0);
+      const expected = action === "new-login" || action === "target" ? "replacement"
+        : action === "logout" ? "missing" : action === "recovery" ? "recovery" : action === "refresh" ? "candidate" : "previous";
+      expect(await sessionIs(expected)).toBe(true);
+      if (action === "pending-logout") {
+        releaseLogout(new Response(null, { status: 200 }));
+        expect(await loggingOut).toBe(true);
+        expect(await sessionIs("missing")).toBe(true);
+      }
+      await close();
+      expect(await sessionIs(action === "refresh" ? "previous" : action === "pending-logout" ? "missing" : expected)).toBe(true);
+    }, html => new Response(html("recovery")), {
+      logout: () => new Promise<Response>(resolve => { releaseLogout = resolve; }),
+      pairing: html => {
+        const body = html("candidate");
+        const response = new Response(body, { headers: { "content-type": "text/html" } });
+        if (stage === "headers") return new Promise<Response>(resolve => {
+          releaseExchange = () => resolve(response);
+          markPending();
+        });
+        response.text = () => new Promise<string>(resolve => {
+          releaseExchange = () => resolve(body);
+          markPending();
+        });
+        return response;
+      },
+    });
+});
+
+test.each(["success-first", "success-last"] as const)("overlapping logouts retain successful logout with %s responses", async order => {
+  const releases: ((response: Response) => void)[] = [];
+  await withPairingValidation(() => new Response(null, { status: 503 }),
+    async ({ submit, logout, startBackground401, sessionIs, counts, close }) => {
+      await submit();
+      const first = logout();
+      const second = logout();
+      releases[0](new Response(null, { status: order === "success-first" ? 200 : 503 }));
+      expect(await first).toBe(order === "success-first");
+      releases[1](new Response(null, { status: order === "success-last" ? 200 : 503 }));
+      expect(await second).toBe(order === "success-last");
+      expect(await sessionIs("missing")).toBe(true);
+      expect((await startBackground401()).status).toBe(401);
+      expect(counts.bootstraps).toBe(0);
+      await close();
+      expect(await sessionIs("missing")).toBe(true);
+    }, html => new Response(html("recovery")), {
+      logout: () => new Promise<Response>(resolve => { releases.push(resolve); }),
+    });
+});
+
+test.each(["new-login", "logout", "target"] as const)("pairing install notification yields to synchronous %s", async action => {
+  await withPairingValidation(() => new Response(null, { status: 401 }),
+    async ({ submit, replaceSession, logout, replaceTarget, sessionIs, counts, close }) => {
+      let loggingOut: Promise<boolean> | undefined;
+      const onChange = () => {
+        window.removeEventListener("opencodex:session-changed", onChange);
+        if (action === "new-login") replaceSession();
+        if (action === "logout") loggingOut = logout();
+        if (action === "target") { replaceTarget(); replaceSession(); }
+      };
+      window.addEventListener("opencodex:session-changed", onChange);
+      await submit();
+      if (loggingOut) expect(await loggingOut).toBe(true);
+      expect(counts.validations).toBe(0);
+      expect(await sessionIs(action === "logout" ? "missing" : "replacement")).toBe(true);
+      await close();
+      expect(await sessionIs(action === "logout" ? "missing" : "replacement")).toBe(true);
+    });
+});
+
+test("explicit login after completed logout permits current automatic recovery", async () => {
+  await withPairingValidation(() => new Response(null, { status: 503 }),
+    async ({ submit, logout, replaceSession, startBackground401, sessionIs, counts }) => {
+      await submit();
+      expect(await logout()).toBe(true);
+      expect(await sessionIs("missing")).toBe(true);
+      replaceSession();
+      expect((await startBackground401()).status).toBe(200);
+      expect(counts.bootstraps).toBe(1);
+      expect(await sessionIs("recovery")).toBe(true);
+    }, html => new Response(html("recovery")));
 });

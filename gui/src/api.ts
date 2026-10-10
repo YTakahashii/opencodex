@@ -31,6 +31,8 @@ interface TargetRuntime {
   target: ApiTarget;
   session: ApiSessionState;
   generation: object;
+  // Pending/successful explicit logout blocks renewal until an explicit login replaces it.
+  logoutBarrier: { pending: number; completed: boolean } | null;
   resolutionInFlight: Promise<SessionSnapshot | null> | null;
   promptCancelled: boolean;
 }
@@ -77,7 +79,7 @@ function isCurrentRevision(plane: ApiPlane, revision: SessionRevision): boolean 
 }
 
 function isCurrentRecovery(recovery: RecoveryAttempt): boolean {
-  return recovery.active && isCurrentRevision(recovery.plane, recovery);
+  return recovery.active && !recovery.state.logoutBarrier && isCurrentRevision(recovery.plane, recovery);
 }
 
 function updateSession(state: TargetRuntime, session: ApiSessionState, recovery?: RecoveryAttempt): void {
@@ -95,9 +97,9 @@ function blankSession(): ApiSessionState {
 }
 
 /** Automatic invalidation retains rollback authority; login, logout and target changes do not. */
-function invalidateSession(state: TargetRuntime, recovery?: RecoveryAttempt): void {
+function invalidateSession(state: TargetRuntime, recovery?: RecoveryAttempt, handoffOwner?: object): void {
   const cleared = blankSession();
-  const owner = sessionHandoffOwners.get(state.session);
+  const owner = handoffOwner ?? sessionHandoffOwners.get(state.session);
   if (owner) sessionHandoffOwners.set(cleared, owner);
   updateSession(state, cleared, recovery);
 }
@@ -119,11 +121,12 @@ export function configureApiTargets(targets: ApiTargets): void {
     if (current && sameTarget(current.target, targets[plane])) {
       if (current.target.bootstrapPath !== targets[plane].bootstrapPath) {
         advanceSessionGeneration(current);
+        current.logoutBarrier = null;
         sessionHandoffOwners.delete(current.session);
       }
       current.target = targets[plane];
     } else runtimes.set(plane, {
-      target: targets[plane], session: blankSession(), generation: {}, resolutionInFlight: null, promptCancelled: false,
+      target: targets[plane], session: blankSession(), generation: {}, logoutBarrier: null, resolutionInFlight: null, promptCancelled: false,
     });
   }
 }
@@ -135,7 +138,7 @@ function runtime(plane: ApiPlane): TargetRuntime {
 
 function clearSessionIfCurrent(plane: ApiPlane, expected: string | null): void {
   const state = runtime(plane);
-  if (expected !== null && state.session.token === expected) invalidateSession(state);
+  if (!state.logoutBarrier && expected !== null && state.session.token === expected) invalidateSession(state);
 }
 
 function storeSession(
@@ -145,15 +148,19 @@ function storeSession(
   browserOrigin: string | null,
   serverOrigin: string | null,
   recovery?: RecoveryAttempt,
+  handoffOwner?: object,
 ): boolean {
   if (recovery && !isCurrentRecovery(recovery)) return false;
   const state = runtime(plane);
   if (!token?.startsWith("ocx_session_") || !csrfToken
     || browserOrigin !== window.location.origin || serverOrigin !== state.target.serverOrigin) {
-    invalidateSession(state, recovery);
+    invalidateSession(state, recovery, handoffOwner);
     return false;
   }
-  updateSession(state, { token, csrfToken, browserOrigin, serverOrigin }, recovery);
+  const session = { token, csrfToken, browserOrigin, serverOrigin };
+  if (handoffOwner) sessionHandoffOwners.set(session, handoffOwner);
+  if (!recovery) state.logoutBarrier = null;
+  updateSession(state, session, recovery);
   if (recovery && !isCurrentRecovery(recovery)) return false;
   state.promptCancelled = false;
   return true;
@@ -165,13 +172,16 @@ export function hasApiSession(plane: ApiPlane): boolean {
 
 export async function logoutApiSession(plane: ApiPlane): Promise<boolean> {
   const state = runtime(plane);
+  const barrier = state.logoutBarrier ?? { pending: 0, completed: false };
+  state.logoutBarrier = barrier;
   advanceSessionGeneration(state);
   sessionHandoffOwners.delete(state.session);
-  const revision = sessionSnapshot(state);
   if (!state.session.token?.startsWith("ocx_session_")) {
     // An explicit logout also supersedes recovery of an already-invalidated candidate.
+    barrier.completed = true;
     return false;
   }
+  barrier.pending++;
   const bounded = createBoundedFetch(SESSION_REBOOTSTRAP_TIMEOUT_MS);
   try {
     const response = await fetchApiSessionValidation(plane, `${state.target.baseUrl}/api/session/logout`, {
@@ -179,7 +189,8 @@ export async function logoutApiSession(plane: ApiPlane): Promise<boolean> {
       signal: bounded.signal,
     });
     if (!response.ok) return false;
-    if (isCurrentRevision(plane, revision)) {
+    barrier.completed = true;
+    if (runtimes.get(plane) === state && state.logoutBarrier === barrier) {
       updateSession(state, blankSession());
       state.promptCancelled = false;
     }
@@ -188,6 +199,8 @@ export async function logoutApiSession(plane: ApiPlane): Promise<boolean> {
     return false;
   } finally {
     bounded.clear();
+    barrier.pending--;
+    if (!barrier.pending && !barrier.completed && state.logoutBarrier === barrier) state.logoutBarrier = null;
   }
 }
 
@@ -226,7 +239,7 @@ export function installApiSessionFromHtml(plane: ApiPlane, html: string): boolea
   return installSessionFromHtml(plane, html);
 }
 
-function installSessionFromHtml(plane: ApiPlane, html: string, recovery?: RecoveryAttempt): boolean {
+function installSessionFromHtml(plane: ApiPlane, html: string, recovery?: RecoveryAttempt, handoffOwner?: object): boolean {
   return storeSession(
     plane,
     metaContentFromHtml(html, "opencodex-session-token"),
@@ -234,12 +247,14 @@ function installSessionFromHtml(plane: ApiPlane, html: string, recovery?: Recove
     metaContentFromHtml(html, "opencodex-session-origin"),
     metaContentFromHtml(html, "opencodex-session-server-origin"),
     recovery,
+    handoffOwner,
   );
 }
 
 /** An opaque, memory-only handoff; callers never receive session credential values. */
 export function beginApiSessionHandoff(plane: ApiPlane) {
   const state = runtime(plane);
+  const revision = sessionSnapshot(state);
   let previous: ApiSessionState | null = state.session;
   const owner = {};
   const release = () => {
@@ -252,9 +267,10 @@ export function beginApiSessionHandoff(plane: ApiPlane) {
   };
   return {
     install(html: string): boolean {
-      const accepted = installApiSessionFromHtml(plane, html);
-      sessionHandoffOwners.set(state.session, owner);
-      return accepted;
+      if (!previous || !isCurrentRevision(plane, revision)) return false;
+      const accepted = installSessionFromHtml(plane, html, undefined, owner);
+      // Event listeners may synchronously install a newer session or start logout.
+      return accepted && runtimes.get(plane) === state && sessionHandoffOwners.get(state.session) === owner;
     },
     commit: release,
     rollback(): void {
@@ -369,7 +385,7 @@ async function verifyAdminToken(plane: ApiPlane, token: string): ReturnType<Admi
 
 async function resolveTokenAfter401(plane: ApiPlane, failedToken: string | null, callerSignal?: AbortSignal): Promise<SessionSnapshot | null> {
   const state = runtime(plane);
-  if (callerSignal?.aborted) return null;
+  if (callerSignal?.aborted || state.logoutBarrier) return null;
   if (state.promptCancelled) return sessionSnapshot(state);
   if (!state.resolutionInFlight) {
     const recovery: RecoveryAttempt = { plane, state, generation: state.generation, active: true };
@@ -384,8 +400,11 @@ async function resolveTokenAfter401(plane: ApiPlane, failedToken: string | null,
           resolve({ kind: "failed" });
         }, resolutionWatchdogMs); }),
       ]).finally(() => clearTimeout(watchdog));
+      if (!isCurrentRevision(plane, recovery)) return null;
+      // Expiry stops late writes, but a still-current timeout must notify the shell.
+      if (renewed.kind === "failed") return sessionSnapshot(state);
       if (!isCurrentRecovery(recovery)) return null;
-      if (renewed.kind === "minted" || renewed.kind === "failed") return sessionSnapshot(state);
+      if (renewed.kind === "minted") return sessionSnapshot(state);
       // A non-hub deployment has no admin token the user could supply: the server mints the
       // session itself, so a refusal is a Host/Origin misconfiguration. Surface that instead
       // of a password box the user cannot answer (#3353, #3483).
@@ -444,7 +463,7 @@ export function installApiAuthFetch(): void {
     const [firstInput, firstInit] = withAuth(classified.plane, input, init, pairingExchange ? null : undefined);
     const response = await originalFetch(firstInput, firstInit);
     if (classified.bootstrap || response.status !== 401) return response;
-    if (runtimes.get(classified.plane) !== state) return response;
+    if (runtimes.get(classified.plane) !== state || state.logoutBarrier) return response;
     const refreshed = state.session.token;
     if (refreshed && (refreshed !== token || state.generation !== generation)) {
       const revision = sessionSnapshot(state);

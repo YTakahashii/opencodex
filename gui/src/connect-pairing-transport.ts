@@ -75,6 +75,8 @@ export async function submitConnectPairing(
   // evaluated, which on the relay path is the unwrapped original, so the request went out
   // unauthenticated and the relay refused it.
   const send = fetchImpl ?? ((input, init) => window.fetch(input, init));
+  // Capture authority before either response headers or body can yield to another login.
+  const handoff = beginApiSessionHandoff("shared");
   let response: Response;
   try {
     response = await send(target.bootstrapPath, {
@@ -98,7 +100,6 @@ export async function submitConnectPairing(
   catch (error) { if (signal?.aborted) throw error; throw new PairingError("invalid-response"); }
   signal?.throwIfAborted();
   if (isCloudflareChallenge(response, html)) throw new PairingError("cloudflare-challenge");
-  const handoff = beginApiSessionHandoff("shared");
   if (!handoff.install(html)) {
     handoff.rollback();
     throw new PairingError("invalid-response");
