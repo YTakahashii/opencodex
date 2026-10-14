@@ -156,3 +156,12 @@ on this transport, and models can still return an invalid answer. The adapter do
 into an approval decision. Auto-review callers should validate the returned JSON and use a
 structured-output-capable route when strict enforcement is required. Ordinary text requests and
 intermediate tool calls keep their existing behavior.
+
+## Bedrock Claude model ids
+
+For a custom provider using the `anthropic` adapter, Bedrock model ids such as
+`global.anthropic.claude-sonnet-5-5` receive the same thinking, sampling and tool-choice
+rules as their Claude family. The full model id is preserved in the upstream request.
+Select it with your configured provider name, for example
+`Bedrock/global.anthropic.claude-sonnet-5-5`. The built-in `anthropic-apikey` preset
+targets the Anthropic API; use a custom provider for a Bedrock Messages endpoint.

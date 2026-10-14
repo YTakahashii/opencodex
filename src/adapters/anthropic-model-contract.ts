@@ -37,10 +37,11 @@ const ADAPTIVE_THINKING_FAMILY_MINIMUMS: Record<string, readonly [major: number,
  * suffixed ids ("claude-opus-4-8[1m]") still match.
  */
 export function claudeFamilyVersion(modelId: string): { family: string; major: number; minor: number } | undefined {
+  // Recognize Bedrock's optional region + `anthropic.` prefix without rewriting the wire id.
   // Find the segment that actually starts with `claude-`, rather than assuming it is either
   // the first (breaks `anthropic/claude-sonnet-5`) or the last (breaks `claude-sonnet-5/variant`,
   // where the slash carries a vendor suffix rather than a routing prefix).
-  const match = /(?:^|\/)claude-([a-z]+)-(\d+)(?:[.-](\d{1,2}))?(?!\d)/i.exec(modelId);
+  const match = /(?:^|\/)(?:(?:[a-z]+\.)?anthropic\.)?claude-([a-z]+)-(\d+)(?:[.-](\d{1,2}))?(?!\d)/i.exec(modelId);
   if (!match) return undefined;
   return {
     family: match[1]!.toLowerCase(),
