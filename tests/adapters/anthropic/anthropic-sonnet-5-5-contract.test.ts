@@ -25,6 +25,23 @@ async function wireBody(modelId: string, options: Record<string, unknown>, tools
 }
 
 describe("Claude Sonnet 5.5 wire contract", () => {
+  test.each([
+    "global.anthropic.claude-sonnet-5-5",
+    "us.anthropic.claude-sonnet-5-5",
+    "anthropic.claude-sonnet-5-5",
+    "Bedrock/global.anthropic.claude-sonnet-5-5",
+  ])("Bedrock model %s preserves its id and applies the Sonnet contract", async (modelId) => {
+    const body = await wireBody(modelId, { reasoning: "high", temperature: 0.2, topP: 0.9, toolChoice: "required" }, [TOOL]);
+    expect(body.model).toBe(modelId);
+    expect(body.thinking).toEqual({ type: "adaptive", display: "summarized" });
+    expect(body.output_config).toEqual({ effort: "high" });
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBeUndefined();
+    expect(body.tool_choice).toEqual({ type: "auto" });
+    expect((await wireBody(modelId, { reasoning: "none" })).thinking).toEqual({ type: "between_tools" });
+    expect(sidecarThinkingOff(modelId)).toEqual({ thinking: { type: "between_tools" } });
+  });
+
   test("reasoning none sends between_tools with no effort and no sampling parameters", async () => {
     for (const modelId of ["claude-sonnet-5-5", "anthropic/claude-sonnet-5.5"]) {
       const body = await wireBody(modelId, { reasoning: "none", temperature: 0.2, topP: 0.9 });

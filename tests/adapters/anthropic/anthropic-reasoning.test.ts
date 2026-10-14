@@ -530,6 +530,7 @@ describe("anthropic extended-thinking gate", () => {
     "claude-sonnet-4-5",
     "claude-opus-4-6",
     "claude-opus-4-20250514",
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0",
     // Capitalized/dotted ids below the adaptive threshold must stay on the legacy
     // wire shape (guard against over-broad family parsing).
     "Claude-Opus-4.6-joybuilder",
